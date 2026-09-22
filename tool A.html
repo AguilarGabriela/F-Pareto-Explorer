@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pareto Explorer — Tool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  html, body, #root { height: 100%; margin: 0; }
+  body { background: #FFFFFF; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+
+const BG = "#FFFFFF";
+const PANEL = "#F6F6F5";
+const PANEL_LIGHT = "#FFFFFF";
+const BORDER = "#E4E4E2";
+const TEXT = "#111111";
+const MUTED = "#6B7280";
+const EMERALD = "#0B6E4F";
+const EMERALD_DARK = "#084C37";
+
+const TOP_COLORS = ["#0B6E4F", "#2A6F97", "#B5651D", "#7B4F9E", "#B0413E", "#4C6444", "#A6763D", "#3A5A78"];
+const SCENARIO_COLORS = ["#1F6F8B", "#C77B2E", "#7A4E9E", "#3D8B6D", "#C4577A", "#5C7A99", "#9E7A4E", "#6B4E7A"];
+
+function lerpColor(a, b, t) {
+  const pa = a.match(/\w\w/g).map((h) => parseInt(h, 16));
+  const pb = b.match(/\w\w/g).map((h) => parseInt(h, 16));
+  const p = pa.map((v, i) => Math.round(v + (pb[i] - v) * t));
+  return `rgb(${p[0]},${p[1]},${p[2]})`;
+}
+
+function fmtNum(v) {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  if (typeof v !== "number") return String(v);
+  if (Math.abs(v) >= 1000) return v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (Number.isInteger(v)) return String(v);
+  return v.toLocaleString(undefined, { maximumFractionDigits: 3 });
+}
+
+// Wraps a label into up to 2 lines of roughly maxCharsPerLine each, truncating with an ellipsis beyond that
+function wrapTwoLines(text, maxCharsPerLine) {
+  if (text.length <= maxCharsPerLine) return [text];
+  const words = text.split(" ");
+  let line1 = "", line2 = "";
+  for (const w of words) {
+    const tryLine1 = (line1 + " " + w).trim();
+    const tryLine2 = (line2 + " " + w).trim();
+    if (!line2 && tryLine1.length <= maxCharsPerLine) {
+      line1 = tryLine1;
+    } else if (tryLine2.length <= maxCharsPerLine) {
+      line2 = tryLine2;
+    } else {
+      line2 = tryLine2;
+      break;
+    }
+  }
+  if (!line1) { line1 = text.slice(0, maxCharsPerLine); line2 = text.slice(maxCharsPerLine); }
+  if (line2.length > maxCharsPerLine) line2 = line2.slice(0, maxCharsPerLine - 1) + "…";
+  return line2 ? [line1, line2] : [line1];
+}
+
+function niceNumber(range, round) {
+  if (range === 0) return 1;
+  const exponent = Math.floor(Math.log10(range));
+  const fraction = range / Math.pow(10, exponent);
+  let niceFraction;
+  if (round) {
+    if (fraction < 1.5) niceFraction = 1;
+    else if (fraction < 3) niceFraction = 2;
+    else if (fraction < 7) niceFraction = 5;
+    else niceFraction = 10;
+  } else {
+    if (fraction <= 1) niceFraction = 1;
+    else if (fraction <= 2) niceFraction = 2;
+    else if (fraction <= 5) niceFraction = 5;
+    else niceFraction = 10;
+  }
+  return niceFraction * Math.pow(10, exponent);
+}
+
+// Produces "nice" round ticks that tightly cover the data range (won't overshoot far past the real max/min)
+function niceTicksN(dataMin, dataMax, targetCount) {
+  if (dataMin === dataMax) { dataMin -= 1; dataMax += 1; }
+  targetCount = Math.max(2, Math.round(targetCount));
+  const range = niceNumber(dataMax - dataMin, false);
+  const step = niceNumber(range / (targetCount - 1), true);
+  const niceMin = Math.floor(dataMin / step) * step;
+  const niceMax = Math.ceil(dataMax / step) * step;
+  const ticks = [];
+  for (let v = niceMin; v <= niceMax + step * 0.5; v += step) {
+    ticks.push(Math.round((v + Number.EPSILON) * 1e9) / 1e9);
+  }
+  return { min: niceMin, max: niceMax, step, ticks };
+}
+
+const ROLE_LABELS = {
+  ignore: "Ignore",
+  variable: "Show as variable",
+  min: "Objective (Minimize)",
+  max: "Objective (Maximize)",
+};
+
+function ParetoExplorer() {
+  const [fileName, setFileName] = useState(null);
+  const [rows, setRows] = useState(null);
+  const [columns, setColumns] = useState([]);
+  const [roles, setRoles] = useState({});
+  const [weights, setWeights] = useState({});
+  const [error, setError] = useState(null);
+  const [xCol, setXCol] = useState(null);
+  const [yCol, setYCol] = useState(null);
+  const [showVars, setShowVars] = useState(true);
+  const [hoverPoint, setHoverPoint] = useState(null);
+  const [hoverScenPoint, setHoverScenPoint] = useState(null);
+  const [hoverLine, setHoverLine] = useState(null);
+  const [chartView, setChartView] = useState("scatter"); // "scatter" | "parallel" | "histograms"
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [displayNames, setDisplayNames] = useState({});
+  const [topN, setTopN] = useState(5);
+  const [topNDraft, setTopNDraft] = useState("5");
+  const [autoDetected, setAutoDetected] = useState(false);
+  const [draftWeights, setDraftWeights] = useState({});
+  const [locked, setLocked] = useState({});
+  const [scenarios, setScenarios] = useState([]);
+  const [showSaveScenario, setShowSaveScenario] = useState(false);
+  const [newScenarioName, setNewScenarioName] = useState("");
+  const weightDebounceRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setError(null);
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const data = new Uint8Array(evt.target.result);
+        const wb = XLSX.read(data, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+        if (!raw.length) {
+          setError("This file doesn't seem to have any rows in it.");
+          return;
+        }
+
+        const ROLE_WORDS = { variable: "variable", objective: "objective", ignore: "ignore" };
+        const row0 = raw[0] || [];
+        const nonEmpty0 = row0.filter((v) => v !== null && v !== "");
+        const looksLikeRoleRow =
+          nonEmpty0.length > 0 &&
+          nonEmpty0.every((v) => ROLE_WORDS[String(v).trim().toLowerCase()]);
+
+        let headerRow, dataStart, fileRoles;
+        if (looksLikeRoleRow && raw.length > 1) {
+          fileRoles = row0.map((v) => (v === null ? null : ROLE_WORDS[String(v).trim().toLowerCase()] || null));
+          headerRow = raw[1] || [];
+          dataStart = 2;
+        } else {
+          fileRoles = null;
+          headerRow = row0;
+          dataStart = 1;
+        }
+
+        const cols = headerRow.map((h, i) => (h === null || h === "" ? `Column ${i + 1}` : String(h)));
+        const dataRows = raw.slice(dataStart).filter((r) => r && r.some((v) => v !== null && v !== ""));
+        const json = dataRows.map((r) => {
+          const obj = {};
+          cols.forEach((c, i) => { obj[c] = r[i] === undefined ? null : r[i]; });
+          return obj;
+        });
+
+        if (!json.length) {
+          setError("This file doesn't seem to have any data rows in it.");
+          return;
+        }
+
+        const initRoles = {};
+        cols.forEach((c, i) => {
+          if (fileRoles && fileRoles[i] === "objective") {
+            initRoles[c] = "min"; // direction defaults to minimize; adjust in step 3 below
+          } else if (fileRoles && fileRoles[i] === "variable") {
+            initRoles[c] = "variable";
+          } else if (fileRoles && fileRoles[i] === "ignore") {
+            initRoles[c] = "ignore";
+          } else {
+            const isNumeric = json.every((r) => r[c] === null || typeof r[c] === "number");
+            initRoles[c] = isNumeric ? "variable" : "ignore";
+          }
+        });
+
+        setColumns(cols);
+        setRoles(initRoles);
+        setRows(json);
+        setWeights({});
+        setXCol(null);
+        setYCol(null);
+        setFileName(file.name);
+        const initNames = {};
+        cols.forEach((c) => { initNames[c] = c; });
+        setDisplayNames(initNames);
+        setAutoDetected(!!fileRoles);
+        setLocked({});
+        setScenarios([]);
+        setShowSaveScenario(false);
+        if (fileRoles) {
+          setError(null);
+        }
+      } catch (err) {
+        setError("Couldn't read that file. Make sure it's a .xlsx or .xls spreadsheet.");
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  const objectives = useMemo(
+    () => columns.filter((c) => roles[c] === "min" || roles[c] === "max"),
+    [columns, roles]
+  );
+  const variables = useMemo(
+    () => columns.filter((c) => roles[c] === "variable"),
+    [columns, roles]
+  );
+  const objKey = objectives.join("|");
+
+  useEffect(() => {
+    if (!objectives.length) return;
+    setWeights((prev) => {
+      const next = {};
+      objectives.forEach((o) => {
+        next[o] = prev[o] !== undefined ? prev[o] : 100 / objectives.length;
+      });
+      return next;
+    });
+    setXCol((prev) => (prev && objectives.includes(prev) ? prev : objectives[0] || null));
+    setYCol((prev) =>
+      prev && objectives.includes(prev) ? prev : objectives[1] || objectives[0] || null
+    );
+    setScenXCol((prev) => (prev && objectives.includes(prev) ? prev : objectives[0] || null));
+    setScenYCol((prev) =>
+      prev && objectives.includes(prev) ? prev : objectives[1] || objectives[0] || null
+    );
+    setScenarios([]);
+    setShowSaveScenario(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objKey]);
+
+  function commitWeight(col, rawVal) {
+    const newVal = Math.max(0, Math.min(100, rawVal));
+    setWeights((prev) => {
+      const lockedOthersSum = objectives
+        .filter((o) => o !== col && locked[o])
+        .reduce((s, o) => s + (prev[o] || 0), 0);
+      const maxAllowed = 100 - lockedOthersSum;
+      const clamped = Math.min(newVal, maxAllowed);
+      const others = objectives.filter((o) => o !== col && !locked[o]);
+      const remaining = maxAllowed - clamped;
+      const othersSum = others.reduce((s, o) => s + (prev[o] || 0), 0);
+      const next = { ...prev, [col]: clamped };
+      if (others.length > 0) {
+        if (othersSum <= 0) {
+          const share = remaining / others.length;
+          others.forEach((o) => { next[o] = share; });
+        } else {
+          others.forEach((o) => {
+            next[o] = ((prev[o] || 0) / othersSum) * remaining;
+          });
+        }
+      }
+      setDraftWeights(next);
+      return next;
+    });
+  }
+
+  // Fast path for slider dragging: update the on-screen number instantly,
+  // but wait briefly before running the real recalculation across all objectives.
+  function draftWeightChange(col, val) {
+    setDraftWeights((prev) => ({ ...prev, [col]: val }));
+    clearTimeout(weightDebounceRef.current);
+    weightDebounceRef.current = setTimeout(() => commitWeight(col, val), 60);
+  }
+
+  function toggleLock(col) {
+    setLocked((prev) => {
+      const willLock = !prev[col];
+      if (willLock) {
+        const unlockedCount = objectives.filter((o) => o !== col && !prev[o]).length;
+        if (unlockedCount === 0) return prev; // never allow locking the last unlocked objective
+      }
+      return { ...prev, [col]: willLock };
+    });
+  }
+
+  useEffect(() => {
+    if ((chartView === "scatter" || chartView === "parallel") && objectives.length < 2 && variables.length > 0) {
+      setChartView("histograms");
+    } else if (chartView === "histograms" && variables.length === 0 && objectives.length >= 2) {
+      setChartView("scatter");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [objectives.length, variables.length]);
+
+  useEffect(() => {
+    setDraftWeights(weights);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(weights)]);
+
+  useEffect(() => {
+    setTopNDraft(String(topN));
+  }, [topN]);
+
+  function saveScenario() {
+    const name = newScenarioName.trim();
+    if (!name || scenarios.length >= 8) return;
+    const color = SCENARIO_COLORS[scenarios.length % SCENARIO_COLORS.length];
+    setScenarios((prev) => [...prev, { id: Date.now() + "-" + Math.random(), name, weights: { ...weights }, color }]);
+    setNewScenarioName("");
+    setShowSaveScenario(false);
+  }
+
+  function commitTopN(val) {
+    const n = Math.max(1, Number(val) || 1);
+    setTopN(n);
+    setTopNDraft(String(n));
+  }
+
+  function setRole(col, role) {
+    setRoles((prev) => ({ ...prev, [col]: role }));
+  }
+
+  function computeResultsForWeights(weightsObj) {
+    if (!rows || objectives.length < 1) return null;
+    const X = rows.map((r) => objectives.map((o) => Number(r[o])));
+    const denom = objectives.map((_, j) => {
+      const s = Math.sqrt(X.reduce((acc, row) => acc + row[j] * row[j], 0));
+      return s || 1;
+    });
+    const R = X.map((row) => row.map((v, j) => v / denom[j]));
+    const wsum = objectives.reduce((s, o) => s + (weightsObj[o] || 0), 0) || 1;
+    const W = objectives.map((o) => (weightsObj[o] || 0) / wsum);
+    const V = R.map((row) => row.map((v, j) => v * W[j]));
+    const best = objectives.map((o, j) => {
+      const col = V.map((row) => row[j]);
+      return roles[o] === "max" ? Math.max(...col) : Math.min(...col);
+    });
+    const worst = objectives.map((o, j) => {
+      const col = V.map((row) => row[j]);
+      return roles[o] === "max" ? Math.min(...col) : Math.max(...col);
+    });
+    const scored = rows.map((r, i) => {
+      const row = V[i];
+      const dPlus = Math.sqrt(row.reduce((s, v, j) => s + (v - best[j]) ** 2, 0));
+      const dMinus = Math.sqrt(row.reduce((s, v, j) => s + (v - worst[j]) ** 2, 0));
+      const c = dPlus + dMinus === 0 ? 0 : dMinus / (dPlus + dMinus);
+      return { row: r, score: c };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((item, idx) => ({ ...item, rank: idx + 1 }));
+  }
+
+  const results = useMemo(() => {
+    return computeResultsForWeights(weights);
+  }, [rows, objKey, JSON.stringify(weights), JSON.stringify(roles)]);
+
+  const chartData = useMemo(() => {
+    if (!results || !xCol || !yCol) return null;
+    const xs = results.map((r) => Number(r.row[xCol]));
+    const ys = results.map((r) => Number(r.row[yCol]));
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const yMin = Math.min(...ys), yMax = Math.max(...ys);
+    return { xs, ys, xMin, xMax, yMin, yMax };
+  }, [results, xCol, yCol]);
+
+  // Scatter chart size: height is directly controlled by our own drag handle (reliable),
+  // width is measured passively since it only changes with window/layout resizes, not dragging.
+  const scatterContainerRef = useRef(null);
+  const [scatterHeight, setScatterHeight] = useState(380);
+  const [scatterWidth, setScatterWidth] = useState(600);
+  useEffect(() => {
+    if (chartView !== "scatter") return;
+    function measure() {
+      const el = scatterContainerRef.current;
+      // Prefer a direct measurement of the container when available and non-zero...
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        // getBoundingClientRect includes the container's own padding, but the SVG only
+        // has the CONTENT area to draw in (padding: 14px right, 74px left = 88px total) — subtract it.
+        const contentWidth = rect.width - 76;
+        if (contentWidth > 0) {
+          setScatterWidth(contentWidth);
+          return;
+        }
+      }
+      // ...otherwise fall back to computing it from the window's own width directly,
+      // which reliably updates on every resize regardless of nested-layout quirks.
+      const sidebarWidth = 284, mainPadding = 48, chartPadding = 76, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - chartPadding - borders);
+      setScatterWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400); // safety net in case resize events are swallowed in this environment
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  function startScatterResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = scatterHeight;
+    function onMove(ev) {
+      setScatterHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  function startParallelResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = parallelHeight;
+    function onMove(ev) {
+      setParallelHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  const [scenXCol, setScenXCol] = useState(null);
+  const [scenYCol, setScenYCol] = useState(null);
+  const scenScatterContainerRef = useRef(null);
+  const [scenScatterWidth, setScenScatterWidth] = useState(600);
+  const [scenScatterHeight, setScenScatterHeight] = useState(380);
+  useEffect(() => {
+    if (chartView !== "scenarios") return;
+    function measure() {
+      const el = scenScatterContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        const contentWidth = rect.width - 76;
+        if (contentWidth > 0) { setScenScatterWidth(contentWidth); return; }
+      }
+      const sidebarWidth = 284, mainPadding = 48, chartPadding = 76, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - chartPadding - borders);
+      setScenScatterWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+  function startScenScatterResize(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startHeight = scenScatterHeight;
+    function onMove(ev) {
+      setScenScatterHeight(Math.max(300, startHeight + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
+  // Parallel coordinates: normalize each objective so "better" always sits near the top of its axis
+  const pcRanges = useMemo(() => {
+    if (!results || objectives.length < 2) return null;
+    return objectives.map((o) => {
+      const vals = results.map((r) => Number(r.row[o]));
+      return { min: Math.min(...vals), max: Math.max(...vals) };
+    });
+  }, [results, objKey]);
+
+  function getVariableHistogram(colName) {
+    const vals = results.map((r) => Number(r.row[colName]));
+    const unique = Array.from(new Set(vals)).sort((a, b) => a - b);
+    let bins;
+    if (unique.length <= 12) {
+      bins = unique.map((u) => ({ label: fmtNum(u), test: (v) => v === u }));
+    } else {
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const nBins = 8;
+      const width = (max - min) / nBins || 1;
+      bins = Array.from({ length: nBins }, (_, i) => {
+        const lo = min + i * width;
+        const hi = i === nBins - 1 ? max : min + (i + 1) * width;
+        return {
+          label: `${fmtNum(lo)}–${fmtNum(hi)}`,
+          test: (v) => (i === nBins - 1 ? v >= lo && v <= hi : v >= lo && v < hi),
+        };
+      });
+    }
+    const counts = bins.map((b) => results.filter((r) => b.test(Number(r.row[colName]))).length);
+    const maxCount = Math.max(...counts, 1);
+    const topMarkers = bins.map(() => []);
+    results.filter((r) => r.rank <= topN).forEach((r) => {
+      const v = Number(r.row[colName]);
+      const idx = bins.findIndex((b) => b.test(v));
+      if (idx >= 0) topMarkers[idx].push(r.rank);
+    });
+    return { bins, counts, maxCount, topMarkers };
+  }
+
+  const parallelContainerRef = useRef(null);
+  const [parallelWidth, setParallelWidth] = useState(600);
+  const [parallelHeight, setParallelHeight] = useState(420);
+  useEffect(() => {
+    if (chartView !== "parallel") return;
+    function measure() {
+      const el = parallelContainerRef.current;
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 0) {
+          setParallelWidth(rect.width);
+          return;
+        }
+      }
+      const sidebarWidth = 284, mainPadding = 48, borders = 2;
+      const fallback = Math.max(200, window.innerWidth - sidebarWidth - mainPadding - borders);
+      setParallelWidth(fallback);
+    }
+    measure();
+    window.addEventListener("resize", measure);
+    const interval = setInterval(measure, 400);
+    return () => {
+      window.removeEventListener("resize", measure);
+      clearInterval(interval);
+    };
+  }, [chartView]);
+
+  function pcGoodness(value, idx) {
+    const { min, max } = pcRanges[idx];
+    if (max === min) return 0.5;
+    const norm = (value - min) / (max - min);
+    return roles[objectives[idx]] === "max" ? norm : 1 - norm;
+  }
+
+  function labelFor(col) {
+    return (displayNames[col] && displayNames[col].trim()) || col;
+  }
+
+  function rankColor(rank) {
+    if (rank > topN) return "#D5D5D2";
+    return TOP_COLORS[(rank - 1) % TOP_COLORS.length];
+  }
+
+  const hasData = !!rows;
+  const hasObjectives = objectives.length > 0;
+
+  return (
+    <div style={{ background: BG, color: TEXT, minHeight: "100%", fontFamily: "-apple-system,'Segoe UI',Helvetica,Arial,sans-serif", padding: "0", display: "flex", flexDirection: "column" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap');
+        .mono { font-family: 'Cascadia Code', 'IBM Plex Mono', ui-monospace, monospace; }
+        input[type=range] { -webkit-appearance: none; height: 4px; background: #DADAD7; border-radius: 2px; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: ${EMERALD_DARK}; cursor: pointer; border: none; margin-top: -5px; }
+        input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: ${EMERALD_DARK}; cursor: pointer; border: none; }
+        select { font-family: inherit; }
+        ::-webkit-scrollbar { height: 8px; width: 8px; }
+        ::-webkit-scrollbar-thumb { background: #D5D5D2; border-radius: 4px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { padding: 6px 10px; white-space: nowrap; text-align: right; font-variant-numeric: tabular-nums; font-family: 'Cascadia Code', ui-monospace, monospace; font-size: 12.5px; }
+        th:first-child, td:first-child { text-align: left; font-family: inherit; }
+        thead th { position: sticky; top: 0; background: ${PANEL}; border-bottom: 1px solid ${BORDER}; font-weight: 600; color: ${MUTED}; }
+        tbody tr:hover { background: #FAFAF9; }
+        .tab-btn { font-size: 12.5px; font-weight: 600; padding: 6px 14px; border-radius: 6px; border: 1px solid ${BORDER}; background: #fff; color: ${TEXT}; cursor: pointer; }
+        .tab-btn.active { background: ${EMERALD_DARK}; color: #fff; border-color: ${EMERALD_DARK}; }
+        .plain-number::-webkit-inner-spin-button, .plain-number::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+        .plain-number { -moz-appearance: textfield; }
+      `}</style>
+
+      {/* Top bar */}
+      <div style={{ background: "#000", padding: "18px 28px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div className="mono" style={{ color: "#fff", fontWeight: 700, fontSize: 19, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+          Pareto Explorer
+        </div>
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={() => setMenuOpen((v) => !v)}
+            style={{ background: "#1c1c1c", color: "#fff", border: "1px solid #333", borderRadius: 6, padding: "7px 14px", fontSize: 13, cursor: "pointer" }}
+          >
+            Menu ▾
+          </button>
+          {menuOpen && (
+            <div style={{ position: "absolute", top: 40, right: 0, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 8, minWidth: 180, boxShadow: "0 8px 24px rgba(0,0,0,0.12)", padding: 6, zIndex: 20 }}>
+              <a href="index.html#how" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>How it works</a>
+              <a href="index.html#contact" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>Contact</a>
+              <a href="index.html" style={{ display: "block", padding: "9px 12px", fontSize: 14, color: TEXT, textDecoration: "none", borderRadius: 5 }}>← Back to home</a>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+        {/* Sidebar */}
+        <div style={{ width: 284, borderRight: `1px solid ${BORDER}`, padding: 20, overflowY: "auto", flexShrink: 0 }}>
+          <div style={{ marginBottom: 22 }}>
+            <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>1. UPLOAD DATA</div>
+            <button
+              onClick={() => fileInputRef.current.click()}
+              style={{
+                width: "100%", padding: "10px 12px", background: PANEL, border: `1px dashed ${BORDER}`,
+                borderRadius: 6, color: TEXT, fontSize: 13, cursor: "pointer",
+              }}
+            >
+              {fileName ? `📄 ${fileName}` : "Choose spreadsheet (.xlsx)"}
+            </button>
+            <input ref={fileInputRef} type="file" accept=".xlsx,.xls" onChange={handleFile} style={{ display: "none" }} />
+            {error && <div style={{ color: "#B3261E", fontSize: 12.5, marginTop: 8 }}>{error}</div>}
+            {hasData && (
+              <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>{rows.length} solutions loaded, {columns.length} columns found.</div>
+            )}
+          </div>
+
+          {hasData && (
+            <div style={{ marginBottom: 22 }}>
+              <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>2. LABEL YOUR COLUMNS</div>
+              {autoDetected && (
+                <div style={{ fontSize: 11.5, color: EMERALD_DARK, background: "rgba(11,110,79,0.07)", border: `1px solid rgba(11,110,79,0.25)`, borderRadius: 6, padding: "6px 10px", marginBottom: 10 }}>
+                  ✓ Column roles were detected automatically from your file's first row. Double-check them below, and set minimize/maximize for each objective.
+                </div>
+              )}
+
+              <div className="mono" style={{ fontSize: 10.5, color: MUTED, marginBottom: 6, letterSpacing: "0.03em" }}>OBJECTIVES</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 16, paddingBottom: 14, borderBottom: `1px solid ${BORDER}` }}>
+                {columns.filter((c) => roles[c] === "min" || roles[c] === "max").length === 0 && (
+                  <div style={{ fontSize: 11.5, color: MUTED, fontStyle: "italic" }}>None yet — set a column below to "Objective".</div>
+                )}
+                {columns.filter((c) => roles[c] === "min" || roles[c] === "max").map((c) => (
+                  <div key={c} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 140 }} title={c}>{c}</span>
+                    <select
+                      value={roles[c] || "ignore"}
+                      onChange={(e) => setRole(c, e.target.value)}
+                      style={{
+                        background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4,
+                        fontSize: 11.5, padding: "3px 4px", flexShrink: 0,
+                      }}
+                    >
+                      {Object.entries(ROLE_LABELS).map(([val, label]) => (
+                        <option key={val} value={val}>{label}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+
+              <div className="mono" style={{ fontSize: 10.5, color: MUTED, marginBottom: 6, letterSpacing: "0.03em" }}>VARIABLES &amp; OTHER COLUMNS</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {columns.filter((c) => roles[c] !== "min" && roles[c] !== "max").map((c) => (
+                  <div key={c} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                    <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 140 }} title={c}>{c}</span>
+                    <select
+                      value={roles[c] || "ignore"}
+                      onChange={(e) => setRole(c, e.target.value)}
+                      style={{
+                        background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4,
+                        fontSize: 11.5, padding: "3px 4px", flexShrink: 0,
+                      }}
+                    >
+                      {Object.entries(ROLE_LABELS).map(([val, label]) => (
+                        <option key={val} value={val}>{label}</option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {hasObjectives && (
+            <div>
+              <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>3. SET YOUR PRIORITIES</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                {objectives.map((o) => {
+                  const pct = Math.round(draftWeights[o] ?? weights[o] ?? 0);
+                  const isLocked = !!locked[o];
+                  return (
+                    <div key={o}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                        <input
+                          value={displayNames[o] ?? o}
+                          onChange={(e) => setDisplayNames((prev) => ({ ...prev, [o]: e.target.value }))}
+                          placeholder={o}
+                          style={{
+                            flex: 1, fontSize: 12.5, fontWeight: 600, border: "none", borderBottom: `1px dashed ${BORDER}`,
+                            background: "transparent", color: TEXT, padding: "2px 0", marginBottom: 4,
+                          }}
+                        />
+                        <button
+                          onClick={() => toggleLock(o)}
+                          title={isLocked ? "Unlock this weight" : "Lock this weight in place"}
+                          style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, padding: "0 2px", opacity: isLocked ? 1 : 0.45, marginBottom: 4 }}
+                        >
+                          {isLocked ? "🔒" : "🔓"}
+                        </button>
+                      </div>
+                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4, color: MUTED }}>
+                        <span>{roles[o] === "max" ? "higher is better" : "lower is better"}</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <input
+                          type="range" min={0} max={100} value={pct} disabled={isLocked}
+                          onChange={(e) => draftWeightChange(o, Number(e.target.value))}
+                          style={{ flex: 1 }}
+                        />
+                        <input
+                          type="number" min={0} max={100} value={pct} disabled={isLocked}
+                          onChange={(e) => commitWeight(o, Number(e.target.value) || 0)}
+                          onFocus={(e) => e.target.select()}
+                          className="mono plain-number"
+                          style={{ width: 46, fontSize: 11.5, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "3px 4px", textAlign: "right", background: isLocked ? PANEL : "#fff", color: isLocked ? MUTED : TEXT }}
+                        />
+                        <span className="mono" style={{ fontSize: 10.5, color: MUTED, width: 14 }}>%</span>
+                      </div>
+                      <div style={{ fontSize: 10, color: MUTED, marginTop: 2 }} className="mono">
+                        = {pct}% of total weight {isLocked && <span style={{ color: EMERALD_DARK, fontWeight: 700 }}>· LOCKED</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ fontSize: 10.5, color: MUTED, marginTop: 10, lineHeight: 1.5 }}>
+                Click 🔒 to lock an objective's weight in place — the others adjust to keep the total at 100%, while the locked one stays put.
+              </div>
+
+              <div style={{ marginTop: 22, paddingTop: 16, borderTop: `1px solid ${BORDER}` }}>
+                <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>SAVED SCENARIOS</div>
+                {scenarios.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
+                    {scenarios.map((sc) => (
+                      <div key={sc.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, padding: "6px 8px", background: PANEL, borderRadius: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                          <span style={{ width: 9, height: 9, borderRadius: 3, background: sc.color, flexShrink: 0 }} />
+                          <span style={{ fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={sc.name}>{sc.name}</span>
+                        </div>
+                        <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                          <button
+                            onClick={() => setWeights(sc.weights)}
+                            title="Load these weights into the sliders"
+                            style={{ fontSize: 10.5, fontWeight: 600, color: EMERALD_DARK, background: "none", border: `1px solid ${EMERALD_DARK}`, borderRadius: 4, padding: "2px 7px", cursor: "pointer" }}
+                          >Load</button>
+                          <button
+                            onClick={() => setScenarios((prev) => prev.filter((s) => s.id !== sc.id))}
+                            title="Delete this scenario"
+                            style={{ fontSize: 12, color: MUTED, background: "none", border: "none", cursor: "pointer", padding: "0 4px" }}
+                          >×</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {!showSaveScenario && (
+                  <button
+                    onClick={() => setShowSaveScenario(true)}
+                    disabled={scenarios.length >= 8}
+                    style={{
+                      fontSize: 12, fontWeight: 600, color: scenarios.length >= 8 ? MUTED : "#fff",
+                      background: scenarios.length >= 8 ? PANEL : EMERALD_DARK, border: "none", borderRadius: 6,
+                      padding: "8px 12px", cursor: scenarios.length >= 8 ? "not-allowed" : "pointer", width: "100%",
+                    }}
+                  >
+                    {scenarios.length >= 8 ? "Scenario limit reached (8)" : "+ Save current weights as a scenario"}
+                  </button>
+                )}
+
+                {showSaveScenario && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <input
+                      autoFocus
+                      value={newScenarioName}
+                      onChange={(e) => setNewScenarioName(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && newScenarioName.trim()) saveScenario(); if (e.key === "Escape") { setShowSaveScenario(false); setNewScenarioName(""); } }}
+                      placeholder="Scenario name (e.g. Carbon-priority)"
+                      style={{ fontSize: 12.5, padding: "6px 8px", border: `1px solid ${BORDER}`, borderRadius: 6 }}
+                    />
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        onClick={saveScenario}
+                        disabled={!newScenarioName.trim()}
+                        style={{ flex: 1, fontSize: 12, fontWeight: 600, color: "#fff", background: newScenarioName.trim() ? EMERALD_DARK : "#B9C4BE", border: "none", borderRadius: 6, padding: "7px 0", cursor: newScenarioName.trim() ? "pointer" : "not-allowed" }}
+                      >Save</button>
+                      <button
+                        onClick={() => { setShowSaveScenario(false); setNewScenarioName(""); }}
+                        style={{ flex: 1, fontSize: 12, fontWeight: 600, color: TEXT, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "7px 0", cursor: "pointer" }}
+                      >Cancel</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ marginTop: 22, paddingTop: 16, borderTop: `1px solid ${BORDER}` }}>
+                <div className="mono" style={{ fontSize: 11.5, color: MUTED, marginBottom: 8, fontWeight: 700, letterSpacing: "0.03em" }}>HIGHLIGHT TOP DESIGNS</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12.5 }}>Highlight top</span>
+                  <input
+                    type="number" min={1} max={results ? results.length : 50} value={topNDraft}
+                    onChange={(e) => setTopNDraft(e.target.value)}
+                    onFocus={(e) => e.target.select()}
+                    onBlur={(e) => commitTopN(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { commitTopN(e.target.value); e.target.blur(); } }}
+                    className="mono plain-number"
+                    style={{ width: 50, fontSize: 12, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "3px 4px", textAlign: "center" }}
+                  />
+                  <span style={{ fontSize: 12.5 }}>designs in the charts</span>
+                </div>
+                <div style={{ fontSize: 10, color: MUTED, marginTop: 4 }}>Press Enter or click away to apply.</div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Main */}
+        <div style={{ flex: 1, overflow: "auto", padding: 24, minWidth: 0 }}>
+          {!hasData && (
+            <div style={{ color: MUTED, fontSize: 14, marginTop: 60, textAlign: "center" }}>
+              Upload a spreadsheet to get started.
+            </div>
+          )}
+
+          {hasData && !hasObjectives && (
+            <div style={{ color: MUTED, fontSize: 14, marginTop: 60, textAlign: "center" }}>
+              Pick at least one column as an objective in the sidebar to see rankings.
+            </div>
+          )}
+
+          {hasObjectives && results && (
+            <>
+              {(objectives.length >= 2 || variables.length > 0 || scenarios.length > 0) && (
+                <div style={{ marginBottom: 24 }}>
+                  <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>Trade-off view</div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      {objectives.length >= 2 && (
+                        <>
+                          <button className={`tab-btn ${chartView === "scatter" ? "active" : ""}`} onClick={() => setChartView("scatter")}>2D scatter</button>
+                          <button className={`tab-btn ${chartView === "parallel" ? "active" : ""}`} onClick={() => setChartView("parallel")}>Parallel coordinates</button>
+                        </>
+                      )}
+                      {variables.length > 0 && (
+                        <button className={`tab-btn ${chartView === "histograms" ? "active" : ""}`} onClick={() => setChartView("histograms")}>Variable histograms</button>
+                      )}
+                      {scenarios.length > 0 && (
+                        <button className={`tab-btn ${chartView === "scenarios" ? "active" : ""}`} onClick={() => setChartView("scenarios")}>Scenarios</button>
+                      )}
+                    </div>
+                    {chartView === "scatter" && (
+                      <div style={{ display: "flex", gap: 8, fontSize: 12, color: MUTED, alignItems: "center" }}>
+                        X:
+                        <select value={xCol} onChange={(e) => setXCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                          {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                        </select>
+                        Y:
+                        <select value={yCol} onChange={(e) => setYCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                          {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                        </select>
+                      </div>
+                    )}
+                  </div>
+
+                  {chartView === "scatter" && (
+                    <>
+                      <div ref={scatterContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "38px", height: scatterHeight, boxSizing: "border-box", overflow: "hidden" }}>
+                        {chartData && (() => {
+                          const W = Math.max(200, scatterWidth);
+                          const H = Math.max(150, scatterHeight - 76);
+                          const marginLeft = 70, marginRight = 10, marginTop = 10, marginBottom = 44;
+                          const plotW = W - marginLeft - marginRight;
+                          const plotH = H - marginTop - marginBottom;
+                          const xTickCount = Math.max(3, Math.round(plotW / 70));
+                          const yTickCount = Math.max(3, Math.round(plotH / 45));
+                          const xAxis = niceTicksN(chartData.xMin, chartData.xMax, xTickCount);
+                          const yAxis = niceTicksN(chartData.yMin, chartData.yMax, yTickCount);
+                          const xToPx = (v) => marginLeft + ((v - xAxis.min) / (xAxis.max - xAxis.min || 1)) * plotW;
+                          const yToPy = (v) => marginTop + (1 - (v - yAxis.min) / (yAxis.max - yAxis.min || 1)) * plotH;
+                          const yTitleMidY = marginTop + plotH / 2;
+                          return (
+                            <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                              {yAxis.ticks.map((t, i) => (
+                                <line key={"hy" + i} x1={marginLeft} x2={marginLeft + plotW} y1={yToPy(t)} y2={yToPy(t)} stroke="#E9E9E6" strokeWidth="1" />
+                              ))}
+                              {xAxis.ticks.map((t, i) => (
+                                <line key={"vx" + i} x1={xToPx(t)} x2={xToPx(t)} y1={marginTop} y2={marginTop + plotH} stroke="#E9E9E6" strokeWidth="1" />
+                              ))}
+                              {yAxis.ticks.map((t, i) => (
+                                <text key={"yl" + i} x={marginLeft - 6} y={yToPy(t) + 3} textAnchor="end" fontSize="9.5" fill={MUTED} className="mono">{fmtNum(t)}</text>
+                              ))}
+                              {xAxis.ticks.map((t, i) => (
+                                <text key={"xl" + i} x={xToPx(t)} y={marginTop + plotH + 13} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtNum(t)}</text>
+                              ))}
+                              <text x={marginLeft + plotW / 2} y={marginTop + plotH + 32} textAnchor="middle" fontSize="14" fontWeight="600" fill={TEXT}>{labelFor(xCol)}</text>
+                              <text x={12} y={yTitleMidY} textAnchor="middle" fontSize="14" fontWeight="600" fill={TEXT} transform={`rotate(-90 12 ${yTitleMidY})`}>{labelFor(yCol)}</text>
+                              {results.map((r, i) => {
+                                const xv = Number(r.row[xCol]);
+                                const yv = Number(r.row[yCol]);
+                                const px = xToPx(xv);
+                                const py = yToPy(yv);
+                                const isTop = r.rank <= topN;
+                                const color = rankColor(r.rank);
+                                return (
+                                  <circle
+                                    key={i} cx={px} cy={py} r={isTop ? 5.5 : 3.5}
+                                    fill={color}
+                                    stroke={isTop ? "#000" : "none"} strokeWidth={isTop ? 1.2 : 0}
+                                    opacity={isTop ? 1 : 0.7}
+                                    onMouseEnter={() => setHoverPoint(r)}
+                                    onMouseLeave={() => setHoverPoint(null)}
+                                    style={{ cursor: "pointer" }}
+                                  />
+                                );
+                              })}
+                            </svg>
+                          );
+                        })()}
+                        <div
+                          onMouseDown={startScatterResize}
+                          title="Drag to resize"
+                          style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                        >
+                          <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                        </div>
+                        {hoverPoint && (
+                          <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5 }}>
+                            <div>Rank #{hoverPoint.rank} · score {hoverPoint.score.toFixed(3)}</div>
+                            <div>{labelFor(xCol)}: {fmtNum(Number(hoverPoint.row[xCol]))}</div>
+                            <div>{labelFor(yCol)}: {fmtNum(Number(hoverPoint.row[yCol]))}</div>
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>The top {topN} designs are highlighted in color (see the ranked table for which color is which rank); the rest are shown in grey.</div>
+                    </>
+                  )}
+
+                  {chartView === "parallel" && pcRanges && (
+                    <>
+                      <div ref={parallelContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, height: parallelHeight, overflow: "hidden" }}>
+                        {(() => {
+                          const W = Math.max(300, parallelWidth);
+                          const H = Math.max(250, parallelHeight - 14);
+                          const n = objectives.length;
+                          const marginSide = 46, marginTop = 58, marginBottom = 58;
+                          const plotTop = marginTop, plotBottom = H - marginBottom;
+                          const plotH = plotBottom - plotTop;
+                          const axisX = (idx) => n === 1 ? W / 2 : marginSide + idx * ((W - marginSide * 2) / (n - 1));
+                          return (
+                            <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                              {objectives.map((o, idx) => {
+                                const x = axisX(idx);
+                                const isMax = roles[o] === "max";
+                                const topVal = isMax ? pcRanges[idx].max : pcRanges[idx].min;
+                                const bottomVal = isMax ? pcRanges[idx].min : pcRanges[idx].max;
+                                // More objectives = less room per axis; wrap into 2 lines before truncating
+                                const maxChars = Math.max(8, Math.round(16 - (n - 2) * 1.5));
+                                const titleLines = wrapTwoLines(labelFor(o), maxChars);
+                                const isFirst = idx === 0;
+                                const isLast = idx === n - 1 && n > 1;
+                                const anchor = isFirst ? "start" : isLast ? "end" : "middle";
+                                const titleX = isFirst ? x + 4 : isLast ? x - 4 : x;
+                                return (
+                                  <g key={o}>
+                                    <line x1={x} x2={x} y1={plotTop} y2={plotBottom} stroke="#D5D5D2" strokeWidth="1" />
+                                    {titleLines.map((line, li) => (
+                                      <text key={li} x={titleX} y={15 + li * 13} textAnchor={anchor} fontSize="10.5" fontWeight="600" fill={TEXT} className="mono">{line}</text>
+                                    ))}
+                                    <text x={x} y={plotTop - 6} textAnchor="middle" fontSize="9.5" fill={EMERALD_DARK} className="mono">{fmtNum(topVal)}</text>
+                                    <text x={x} y={plotBottom + 15} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtNum(bottomVal)}</text>
+                                    <text x={x} y={H - 12} textAnchor="middle" fontSize="10" fill={MUTED}>{isMax ? "higher = better" : "lower = better"}</text>
+                                  </g>
+                                );
+                              })}
+                              {results.map((r, i) => {
+                                const pts = objectives.map((o, idx) => {
+                                  const x = axisX(idx);
+                                  const good = pcGoodness(Number(r.row[o]), idx);
+                                  const y = plotTop + (1 - good) * plotH;
+                                  return `${x},${y}`;
+                                });
+                                const isTop = r.rank <= topN;
+                                const color = rankColor(r.rank);
+                                return (
+                                  <polyline
+                                    key={i}
+                                    points={pts.join(" ")}
+                                    fill="none"
+                                    stroke={color}
+                                    strokeWidth={isTop ? 2.5 : 1}
+                                    opacity={isTop ? 1 : 0.4}
+                                    onMouseEnter={() => setHoverLine(r)}
+                                    onMouseLeave={() => setHoverLine(null)}
+                                    style={{ cursor: "pointer" }}
+                                  />
+                                );
+                              })}
+                            </svg>
+                          );
+                        })()}
+                        <div
+                          onMouseDown={startParallelResize}
+                          title="Drag to resize"
+                          style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                        >
+                          <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                        </div>
+                        {hoverLine && (
+                          <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5 }}>
+                            <div>Rank #{hoverLine.rank} · score {hoverLine.score.toFixed(3)}</div>
+                            {objectives.map((o) => (
+                              <div key={o}>{labelFor(o)}: {fmtNum(Number(hoverLine.row[o]))}</div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>Every objective gets its own vertical axis, oriented so "better" is always near the top — the emerald number at each axis's top and the grey number at its bottom show that objective's actual best and worst values. The top {topN} designs are shown in color; the rest are faint grey.</div>
+                    </>
+                  )}
+
+                  {chartView === "histograms" && (
+                    <>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 16 }}>
+                        {variables.map((v) => {
+                          const { bins, counts, maxCount, topMarkers } = getVariableHistogram(v);
+                          return (
+                            <div key={v} style={{ background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 12px 10px" }}>
+                              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={labelFor(v)}>{labelFor(v)}</div>
+                              <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 100 }}>
+                                {bins.map((b, i) => (
+                                  <div key={i} style={{ flex: 1, height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end" }}>
+                                    <div style={{ display: "flex", gap: 2, marginBottom: 2, flexWrap: "wrap", justifyContent: "center" }}>
+                                      {topMarkers[i].sort((a, b2) => a - b2).map((rank) => (
+                                        <span key={rank} title={`Rank #${rank}`} style={{ width: 6, height: 6, borderRadius: "50%", background: rankColor(rank), display: "inline-block" }} />
+                                      ))}
+                                    </div>
+                                    <div
+                                      title={`${b.label}: ${counts[i]} of ${results.length} solutions`}
+                                      style={{ width: "100%", background: "#C7C7C3", height: `${Math.max(2, (counts[i] / maxCount) * 100)}%`, borderRadius: "2px 2px 0 0" }}
+                                    />
+                                  </div>
+                                ))}
+                              </div>
+                              <div style={{ display: "flex", gap: 3, marginTop: 4 }}>
+                                {bins.map((b, i) => (
+                                  <div key={i} className="mono" style={{ flex: 1, fontSize: 8.5, color: MUTED, textAlign: "center", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={b.label}>{b.label}</div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 10 }}>Each bar shows how many of your {results.length} solutions share that value (or fall in that range). The colored dots above a bar mark where your top {topN} designs land — see the ranked table for which color is which rank.</div>
+                    </>
+                  )}
+
+                  {chartView === "scenarios" && (
+                    <>
+                      {objectives.length >= 2 && (
+                        <div style={{ marginBottom: 28 }}>
+                          <div style={{ display: "flex", gap: 16, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+                            <div style={{ fontSize: 13, fontWeight: 700 }}>Where each scenario's pick sits overall</div>
+                            <div style={{ display: "flex", gap: 8, fontSize: 12, color: MUTED, alignItems: "center" }}>
+                              X:
+                              <select value={scenXCol} onChange={(e) => setScenXCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                                {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                              </select>
+                              Y:
+                              <select value={scenYCol} onChange={(e) => setScenYCol(e.target.value)} style={{ background: "#fff", color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 4, padding: "2px 4px" }}>
+                                {objectives.map((o) => <option key={o} value={o}>{labelFor(o)}</option>)}
+                              </select>
+                            </div>
+                          </div>
+                          <div ref={scenScatterContainerRef} style={{ position: "relative", background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "38px", height: scenScatterHeight, boxSizing: "border-box", overflow: "hidden" }}>
+                            {(() => {
+                              const allX = results.map((r) => Number(r.row[scenXCol]));
+                              const allY = results.map((r) => Number(r.row[scenYCol]));
+                              const xMin = Math.min(...allX), xMax = Math.max(...allX);
+                              const yMin = Math.min(...allY), yMax = Math.max(...allY);
+                              const W = Math.max(200, scenScatterWidth);
+                              const H = Math.max(150, scenScatterHeight - 76);
+                              const marginLeft = 70, marginRight = 10, marginTop = 10, marginBottom = 44;
+                              const plotW = W - marginLeft - marginRight;
+                              const plotH = H - marginTop - marginBottom;
+                              const xTickCount = Math.max(3, Math.round(plotW / 70));
+                              const yTickCount = Math.max(3, Math.round(plotH / 45));
+                              const xAxis = niceTicksN(xMin, xMax, xTickCount);
+                              const yAxis = niceTicksN(yMin, yMax, yTickCount);
+                              const xToPx = (v) => marginLeft + ((v - xAxis.min) / (xAxis.max - xAxis.min || 1)) * plotW;
+                              const yToPy = (v) => marginTop + (1 - (v - yAxis.min) / (yAxis.max - yAxis.min || 1)) * plotH;
+                              const yTitleMidY = marginTop + plotH / 2;
+                              const scenPoints = scenarios.map((sc) => {
+                                const scResults = computeResultsForWeights(sc.weights);
+                                const winner = scResults && scResults[0];
+                                return winner ? { scenario: sc, xv: Number(winner.row[scenXCol]), yv: Number(winner.row[scenYCol]) } : null;
+                              }).filter(Boolean);
+                              return (
+                                <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", overflow: "visible" }}>
+                                  {yAxis.ticks.map((t, i) => (<line key={"hy"+i} x1={marginLeft} x2={marginLeft+plotW} y1={yToPy(t)} y2={yToPy(t)} stroke="#E9E9E6" strokeWidth="1" />))}
+                                  {xAxis.ticks.map((t, i) => (<line key={"vx"+i} x1={xToPx(t)} x2={xToPx(t)} y1={marginTop} y2={marginTop+plotH} stroke="#E9E9E6" strokeWidth="1" />))}
+                                  {yAxis.ticks.map((t, i) => (<text key={"yl"+i} x={marginLeft-6} y={yToPy(t)+3} textAnchor="end" fontSize="9.5" fill={MUTED} className="mono">{fmtNum(t)}</text>))}
+                                  {xAxis.ticks.map((t, i) => (<text key={"xl"+i} x={xToPx(t)} y={marginTop+plotH+13} textAnchor="middle" fontSize="9.5" fill={MUTED} className="mono">{fmtNum(t)}</text>))}
+                                  <text x={marginLeft+plotW/2} y={marginTop+plotH+32} textAnchor="middle" fontSize="14" fontWeight="600" fill={TEXT}>{labelFor(scenXCol)}</text>
+                                  <text x={12} y={yTitleMidY} textAnchor="middle" fontSize="14" fontWeight="600" fill={TEXT} transform={`rotate(-90 12 ${yTitleMidY})`}>{labelFor(scenYCol)}</text>
+                                  {results.map((r, i) => (
+                                    <circle key={i} cx={xToPx(Number(r.row[scenXCol]))} cy={yToPy(Number(r.row[scenYCol]))} r={3} fill="#D5D5D2" opacity={0.6} />
+                                  ))}
+                                  {scenPoints.map((p) => (
+                                    <circle
+                                      key={p.scenario.id} cx={xToPx(p.xv)} cy={yToPy(p.yv)} r={7}
+                                      fill={p.scenario.color} stroke="#000" strokeWidth="1.2"
+                                      onMouseEnter={() => setHoverScenPoint(p)}
+                                      onMouseLeave={() => setHoverScenPoint(null)}
+                                      style={{ cursor: "pointer" }}
+                                    />
+                                  ))}
+                                </svg>
+                              );
+                            })()}
+                            <div
+                              onMouseDown={startScenScatterResize}
+                              title="Drag to resize"
+                              style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 12, cursor: "ns-resize", display: "flex", alignItems: "center", justifyContent: "center" }}
+                            >
+                              <div style={{ width: 34, height: 4, borderRadius: 2, background: "#C7C7C3" }} />
+                            </div>
+                            {hoverScenPoint && (
+                              <div className="mono" style={{ position: "absolute", top: 8, right: 16, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 11.5 }}>
+                                <div style={{ fontWeight: 700 }}>{hoverScenPoint.scenario.name}</div>
+                                <div>{labelFor(scenXCol)}: {fmtNum(hoverScenPoint.xv)}</div>
+                                <div>{labelFor(scenYCol)}: {fmtNum(hoverScenPoint.yv)}</div>
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>Grey dots are all your solutions. Each colored dot is one scenario's winning design — colors match the list in the sidebar.</div>
+                        </div>
+                      )}
+
+                      <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 10 }}>Comparing each scenario's winning design</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 20 }}>
+                        {objectives.map((o) => {
+                          const winners = scenarios.map((sc) => {
+                            const scResults = computeResultsForWeights(sc.weights);
+                            const winner = scResults && scResults[0];
+                            return { scenario: sc, value: winner ? Number(winner.row[o]) : 0 };
+                          });
+                          const values = winners.map((w) => w.value);
+                          let rangeMin = Math.min(0, ...values);
+                          let rangeMax = Math.max(0, ...values);
+                          if (rangeMin === rangeMax) { rangeMin -= 1; rangeMax += 1; }
+                          const W = 280, H = 260;
+                          const topPad = 40, bottomPad = 46;
+                          const plotTop = topPad, plotBottom = H - bottomPad;
+                          const plotH = plotBottom - plotTop;
+                          const yOf = (v) => plotBottom - ((v - rangeMin) / (rangeMax - rangeMin)) * plotH;
+                          const baseline = yOf(0);
+                          const n = winners.length;
+                          const bw = Math.min(44, (W - 24) / n - 16);
+                          const gap = 16;
+                          const totalWidth = n * bw + (n - 1) * gap;
+                          const startX = (W - totalWidth) / 2;
+                          return (
+                            <div key={o} style={{ background: PANEL, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 12px 10px" }}>
+                              <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={labelFor(o)}>{labelFor(o)}</div>
+                              <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ overflow: "visible" }}>
+                                <line x1="4" x2={W - 4} y1={baseline} y2={baseline} stroke="#C7C7C3" strokeWidth="1" />
+                                {winners.map((w, i) => {
+                                  const x = startX + i * (bw + gap);
+                                  const yVal = yOf(w.value);
+                                  const barTop = Math.min(yVal, baseline);
+                                  const barH = Math.max(2, Math.abs(yVal - baseline));
+                                  const labelText = w.scenario.name.length > 18 ? w.scenario.name.slice(0, 17) + "…" : w.scenario.name;
+                                  const isPos = w.value >= 0;
+                                  const numY = isPos ? barTop - 5 : barTop + barH + 12;
+                                  const labelX = x + bw / 2;
+                                  const labelY = isPos ? numY - 12 : numY + 14;
+                                  return (
+                                    <g key={w.scenario.id}>
+                                      <rect x={x} y={barTop} width={bw} height={barH} fill={w.scenario.color} rx="2" />
+                                      <text x={x + bw / 2} y={numY} textAnchor="middle" fontSize="9" fontWeight="600" fill={TEXT} className="mono">{fmtNum(w.value)}</text>
+                                      <text x={labelX} y={labelY} textAnchor={isPos ? "start" : "end"} fontSize="9" fill={MUTED} transform={`rotate(-45 ${labelX} ${labelY})`}>{labelText}</text>
+                                    </g>
+                                  );
+                                })}
+                              </svg>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{ fontSize: 11, color: MUTED, marginTop: 14, marginBottom: 8 }}>Each chart shows the winning design's value for one objective, compared across your saved scenarios.</div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, marginTop: 28 }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>Ranked solutions ({results.length})</div>
+                {variables.length > 0 && (
+                  <label style={{ fontSize: 12, color: MUTED, display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input type="checkbox" checked={showVars} onChange={(e) => setShowVars(e.target.checked)} />
+                    Show variables
+                  </label>
+                )}
+              </div>
+              <div style={{ border: `1px solid ${BORDER}`, borderRadius: 8, overflow: "auto", maxHeight: 480 }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Rank</th>
+                      <th>Score</th>
+                      {objectives.map((o) => <th key={o}>{labelFor(o)}</th>)}
+                      {showVars && variables.map((v) => <th key={v}>{labelFor(v)}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((r) => (
+                      <tr key={r.rank} style={{ background: r.rank <= topN ? "rgba(11,110,79,0.04)" : "transparent" }}>
+                        <td>
+                          {r.rank <= topN ? (
+                            <span className="mono" style={{
+                              display: "inline-flex", alignItems: "center", justifyContent: "center",
+                              width: 24, height: 24, borderRadius: "50%", background: rankColor(r.rank),
+                              color: "#fff", fontWeight: 700, fontSize: 12,
+                            }}>{r.rank}</span>
+                          ) : (
+                            <span style={{ paddingLeft: 3 }}>{r.rank}</span>
+                          )}
+                        </td>
+                        <td>{r.score.toFixed(3)}</td>
+                        {objectives.map((o) => <td key={o}>{fmtNum(Number(r.row[o]))}</td>)}
+                        {showVars && variables.map((v) => <td key={v}>{fmtNum(r.row[v])}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<ParetoExplorer />);
+</script>
+</body>
+</html>

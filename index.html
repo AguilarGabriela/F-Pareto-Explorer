@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pareto Explorer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cascadia+Code:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --emerald: #0B6E4F;
+    --emerald-dark: #084C37;
+    --black: #111111;
+    --grey: #6B7280;
+    --grey-light: #F4F4F3;
+    --border: #E4E4E2;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: var(--black); font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .mono { font-family: 'Cascadia Code', monospace; }
+
+  /* Top bar */
+  .topbar {
+    position: sticky; top: 0; z-index: 10; background: #000;
+    display: flex; align-items: center; justify-content: flex-start; padding: 20px 32px;
+  }
+  .topbar .badge {
+    font-family: 'Cascadia Code', monospace; font-weight: 700; font-size: 21px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: #fff; -webkit-text-stroke: 0.4px #fff;
+  }
+
+  /* Hero */
+  .hero { text-align: center; padding: 96px 24px 80px; max-width: 780px; margin: 0 auto; }
+  .hero h1 {
+    font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase;
+    font-size: 52px; line-height: 1.08; letter-spacing: -0.01em; margin: 0 0 22px;
+    color: var(--black);
+  }
+  .hero h1 span { color: var(--emerald); display: block; }
+  .hero p { font-size: 17px; line-height: 1.6; color: var(--grey); margin: 0 auto 34px; max-width: 560px; }
+  .hero .buttons { display: flex; gap: 14px; justify-content: center; }
+  .btn-primary { background: var(--emerald-dark); color: #fff; padding: 13px 26px; border-radius: 5px; font-weight: 600; text-decoration: none; font-size: 15px; }
+  .btn-secondary { background: #fff; color: var(--black); padding: 13px 26px; border-radius: 5px; font-weight: 600; text-decoration: none; font-size: 15px; border: 1.5px solid var(--border); }
+
+  /* Feature icons */
+  .features { background: var(--grey-light); padding: 70px 24px; }
+  .features-grid { max-width: 1040px; margin: 0 auto; display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; }
+  .feature-card { background: #fff; border: 1px solid var(--border); border-radius: 10px; padding: 28px 22px; text-align: left; }
+  .feature-icon { width: 40px; height: 40px; margin-bottom: 18px; }
+  .feature-card h3 { font-family: 'Cascadia Code', monospace; font-weight: 700; font-size: 14px; text-transform: uppercase; margin: 0 0 10px; letter-spacing: 0.01em; }
+  .feature-card p { font-size: 13.5px; color: var(--grey); line-height: 1.55; margin: 0; }
+
+  /* How it works */
+  .how { padding: 90px 24px; max-width: 900px; margin: 0 auto; }
+  .how h2 { font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase; font-size: 30px; text-align: center; margin: 0 0 56px; }
+  .steps { display: flex; gap: 20px; }
+  .step { flex: 1; text-align: center; position: relative; }
+  .step-num {
+    width: 46px; height: 46px; border-radius: 50%; background: var(--emerald-dark); color: #fff;
+    display: flex; align-items: center; justify-content: center; font-family: 'Cascadia Code', monospace;
+    font-weight: 700; font-size: 17px; margin: 0 auto 16px;
+  }
+  .step h4 { font-size: 15px; font-weight: 700; margin: 0 0 8px; }
+  .step p { font-size: 13.5px; color: var(--grey); line-height: 1.55; margin: 0; padding: 0 10px; }
+
+  /* Before you begin */
+  .notes { background: #fff; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 60px 24px; }
+  .notes-inner { max-width: 640px; margin: 0 auto; }
+  .notes h2 { font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase; font-size: 22px; margin: 0 0 20px; }
+  .notes ul { padding-left: 20px; margin: 0; }
+  .notes li { font-size: 14.5px; line-height: 1.8; color: #333; }
+
+  /* Footer */
+  footer { background: var(--black); color: #ddd; padding: 44px 40px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+  footer .title { font-family: 'Cascadia Code', monospace; font-weight: 700; text-transform: uppercase; color: #fff; font-size: 15px; }
+  footer .contact { display: flex; gap: 22px; font-size: 13.5px; }
+  footer .contact a { color: #ccc; text-decoration: none; }
+  footer .contact a:hover { color: var(--emerald); }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="badge">Pareto Explorer</div>
+  </div>
+
+  <section class="hero">
+    <h1>FIND THE DESIGN<span>THAT FITS YOUR PRIORITIES</span></h1>
+    <p>Upload a set of Pareto-optimal designs from your optimization, weigh your objectives and see which design comes out on top, and exactly what it involves.</p>
+    <div class="buttons">
+      <a class="btn-primary" href="tool.html">Launch the tool</a>
+      <a class="btn-secondary" href="#how">See how it works</a>
+    </div>
+  </section>
+
+  <section class="features">
+    <div class="features-grid">
+      <div class="feature-card">
+        <svg class="feature-icon" viewBox="0 0 40 40" fill="none"><rect x="6" y="26" width="28" height="8" rx="2" stroke="#0B6E4F" stroke-width="2"/><path d="M20 22V6M20 6L13 13M20 6L27 13" stroke="#0B6E4F" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Upload your data</h3>
+        <p>Bring your own Pareto-optimal designs as a spreadsheet (no fixed format required).</p>
+      </div>
+      <div class="feature-card">
+        <svg class="feature-icon" viewBox="0 0 40 40" fill="none"><line x1="8" y1="10" x2="8" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="8" cy="16" r="3.5" fill="#0B6E4F"/><line x1="20" y1="10" x2="20" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="20" cy="24" r="3.5" fill="#0B6E4F"/><line x1="32" y1="10" x2="32" y2="30" stroke="#0B6E4F" stroke-width="2"/><circle cx="32" cy="12" r="3.5" fill="#0B6E4F"/></svg>
+        <h3>Set your priorities</h3>
+        <p>Adjust simple sliders to say how much each objective matters to you.</p>
+      </div>
+      <div class="feature-card">
+        <svg class="feature-icon" viewBox="0 0 40 40" fill="none"><rect x="5" y="8" width="30" height="24" rx="2" stroke="#0B6E4F" stroke-width="2"/><line x1="5" y1="16" x2="35" y2="16" stroke="#0B6E4F" stroke-width="2"/><line x1="15" y1="16" x2="15" y2="32" stroke="#0B6E4F" stroke-width="2"/><line x1="25" y1="16" x2="25" y2="32" stroke="#0B6E4F" stroke-width="2"/></svg>
+        <h3>See the variables</h3>
+        <p>Every ranked design shows what changes it involves.</p>
+      </div>
+      <div class="feature-card">
+        <svg class="feature-icon" viewBox="0 0 40 40" fill="none"><line x1="6" y1="34" x2="34" y2="34" stroke="#0B6E4F" stroke-width="2"/><line x1="6" y1="34" x2="6" y2="8" stroke="#0B6E4F" stroke-width="2"/><circle cx="12" cy="26" r="2.5" fill="#0B6E4F"/><circle cx="20" cy="16" r="2.5" fill="#0B6E4F"/><circle cx="28" cy="21" r="2.5" fill="#0B6E4F"/></svg>
+        <h3>Visualize trade-offs</h3>
+        <p>Compare objectives on a chart and spot the best-fit design at a glance.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="how" id="how">
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <h4>Upload</h4>
+        <p>Drop in your spreadsheet of Pareto-optimal designs.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <h4>Label columns</h4>
+        <p>Tell the tool which columns are objectives, and which direction is better.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <h4>Weigh priorities</h4>
+        <p>Set sliders for how much each objective matters to you.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <h4>Explore results</h4>
+        <p>See ranked designs, their variables, and a trade-off chart.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="notes">
+    <div class="notes-inner">
+      <h2>Before you begin</h2>
+      <ul>
+        <li><strong>File format:</strong> Set up your spreadsheet with one design per row. Every column that holds a number should be either one of your objectives (like cost or carbon) or a design variable (like an insulation level or window type) — the tool will ask you to label each one after you upload.</li>
+        <li><strong>Your data stays private:</strong> This tool does all of its work directly inside your web browser. That means your spreadsheet is never sent to, or stored on, any outside server — not even ours. Closing the page clears everything.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer id="contact">
+    <div class="title">Pareto Explorer</div>
+    <div class="contact">
+      <a href="mailto:gaguilar.dag@gmail.com">gaguilar.dag@gmail.com</a>
+      <a href="#" target="_blank">LinkedIn</a>
+    </div>
+  </footer>
+
+</body>
+</html>
